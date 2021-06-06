@@ -1,148 +1,137 @@
 package main
 
 import (
-	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
-	"log"
+	"fmt"
+	"io"
 	"os"
-	"os/signal"
-	"syscall"
+	"path/filepath"
+	"runtime"
+	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
-const (
-	// максимально допустимое число ошибок при парсинге
-	errorsLimit = 100000
+var dir string
+var workers int
 
-	// число результатов, которые хотим получить
-	resultsLimit = 10000
-)
+type Result struct {
+	file   string
+	sha256 [32]byte
+}
 
-var (
-	// адрес в интернете (например, https://en.wikipedia.org/wiki/Lionel_Messi)
-	url string
+func worker(input chan string, results chan<- *Result, wg *sync.WaitGroup) {
 
-	// насколько глубоко нам надо смотреть (например, 10)
-	depthLimit int
-)
+	log.SetFormatter(&log.JSONFormatter{})
 
-var Crawler *crawler
-
-// Как вы помните, функция инициализации стартует первой
-func init() {
-	// задаём и парсим флаги
-	flag.StringVar(&url, "url", "", "url address")
-	flag.IntVar(&depthLimit, "depth", 3, "max depth for run")
-	flag.Parse()
-
-	// Проверяем обязательное условие
-	if url == "" {
-		log.Print("no url set by flag")
-		flag.PrintDefaults()
-		os.Exit(1)
+	standartFields := log.Fields{
+		"time": time.Now(),
+		"func": "worker",
 	}
+	wlog := log.WithFields(standartFields)
+
+	for file := range input {
+		var h = sha256.New()
+		var sum [32]byte
+		f, err := os.Open(file)
+
+		if err != nil {
+			wlog.Errorf("open file: %v", err)
+			fmt.Fprintln(os.Stderr, err)
+			continue
+		}
+		if _, err = io.Copy(h, f); err != nil {
+			wlog.Errorf("get hash: %v", err)
+			fmt.Fprintln(os.Stderr, err)
+			f.Close()
+			continue
+		}
+		f.Close()
+		copy(sum[:], h.Sum(nil))
+		wlog.Infof("worker result: %v   %v \n", file, sum)
+		results <- &Result{
+			file:   file,
+			sha256: sum,
+		}
+	}
+	wg.Done()
+}
+
+func search(input chan string) {
+	log.SetFormatter(&log.JSONFormatter{})
+
+	standartFields := log.Fields{
+		"time": time.Now(),
+		"func": "search",
+	}
+	slog := log.WithFields(standartFields)
+
+	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			slog.Errorf("walk in dir: %v", err)
+			fmt.Fprintln(os.Stderr, err)
+		} else if info.Mode().IsRegular() {
+			input <- path
+		}
+		return nil
+	})
+	close(input)
 }
 
 func main() {
-	startCrawler()
-}
+	log.SetFormatter(&log.JSONFormatter{})
 
-func startCrawler() {
-	started := time.Now()
+	standartFields := log.Fields{
+		"time": time.Now(),
+		"func": "main",
+	}
+	mlog := log.WithFields(standartFields)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go watchSignals(cancel)
-	defer cancel()
+	flag.StringVar(&dir, "dir", ".", "directory to search")
+	flag.IntVar(&workers, "workers", runtime.NumCPU(), "number of workers")
+	debug := flag.Bool("debug", false, "set log level to debug")
+	flag.Parse()
 
-	Crawler = newCrawler(depthLimit)
+	if *debug {
+		fmt.Printf("debug level enabled \n")
+		log.SetLevel(log.DebugLevel)
+	}
 
-	// создаём канал для результатов
-	results := make(chan crawlResult)
+	fmt.Printf("Searching in %s using %d workers...\n", dir, workers)
 
-	// запускаем горутину для чтения из каналов
-	done := watchCrawler(ctx, results, errorsLimit, resultsLimit)
+	input := make(chan string)
+	results := make(chan *Result)
 
-	// запуск основной логики
-	// внутри есть рекурсивные запуски анализа в других горутинах
-	Crawler.run(ctx, url, results, 0)
+	mlog.Debug("cahnnels created")
 
-	// ждём завершения работы чтения в своей горутине
-	<-done
+	wg := sync.WaitGroup{}
+	wg.Add(workers)
 
-	log.Println(time.Since(started))
-}
+	for i := 0; i < workers; i++ {
+		go worker(input, results, &wg)
+	}
 
-func liteCrawler() {
-	started := time.Now()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go watchSignals(cancel)
-	defer cancel()
-
-	Crawler = copyCrawler(Crawler, 2)
-
-	results := make(chan crawlResult)
-
-	done := watchCrawler(ctx, results, errorsLimit, resultsLimit)
-
-	Crawler.run(ctx, url, results, 0)
-
-	<-done
-
-	log.Println(time.Since(started))
-}
-
-// ловим сигналы выключения
-func watchSignals(cancel context.CancelFunc) {
-	osSignalChan := make(chan os.Signal)
-
+	go search(input)
 	go func() {
-		for sig := range osSignalChan {
-			switch sig {
-			case syscall.SIGINT:
-				log.Printf("got signal %q", sig.String())
-
-				// если сигнал получен, отменяем контекст работы
-				cancel()
-			case syscall.SIGUSR1:
-				liteCrawler()
-
-			}
-		}
+		wg.Wait()
+		close(results)
 	}()
 
-	signal.Notify(osSignalChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1)
-}
+	counter := make(map[[32]byte][]string)
+	for result := range results {
+		counter[result.sha256] = append(counter[result.sha256], result.file)
+	}
 
-func watchCrawler(ctx context.Context, results <-chan crawlResult, maxErrors, maxResults int) chan struct{} {
-	readersDone := make(chan struct{})
-
-	go func() {
-		defer close(readersDone)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-
-			case result := <-results:
-				if result.err != nil {
-					maxErrors--
-					if maxErrors <= 0 {
-						log.Println("max errors exceeded")
-						return
-					}
-					continue
-				}
-
-				log.Printf("crawling result: %v", result.msg)
-				maxResults--
-				if maxResults <= 0 {
-					log.Println("got max results")
-					return
-				}
+	for sha, files := range counter {
+		if len(files) > 1 {
+			fmt.Printf("Found %d duplicates for %s: \n", len(files), hex.EncodeToString(sha[:]))
+			for _, f := range files {
+				fmt.Println("-> ", f)
 			}
 		}
-	}()
+	}
 
-	return readersDone
 }
